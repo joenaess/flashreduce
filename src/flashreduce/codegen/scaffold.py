@@ -1,262 +1,10 @@
-from textwrap import indent, dedent, wrap
-from dataclasses import dataclass, asdict
-from types import SimpleNamespace
+from flashreduce.codegen.util import *
+from flashreduce.codegen.info import *
 from typing import * 
 from itertools import product
-import toolz as tz
-import tempfile
-import importlib.util
-import pathlib
-import os
-import sys
-import copy
-import hashlib
 
-FLASHREDUCE_CACHE = pathlib.Path(os.getenv('FLASHREDUCE_CACHE', 'kernel_cache')).absolute()
-FLASHREDUCE_CACHE.mkdir(exist_ok=True, parents=True)
-(FLASHREDUCE_CACHE / '__init__.py').touch()
-if FLASHREDUCE_CACHE not in sys.path:
-    sys.path.append(str(FLASHREDUCE_CACHE))
 
-def mk_module(source_code):
-    hash = hashlib.sha256(source_code.encode('utf-8')).hexdigest()
-    module = f'generated_module_{hash}'
-    target = FLASHREDUCE_CACHE / f'{module}.py'
-    
-    if target.exists():
-        with open(target, 'rt') as f:
-            assert f.read() == source_code, "hash equals but code mismatch: {target}"
-    else:
-        with open(target, 'wt') as f:
-            f.write(source_code)
-    try:
-        return importlib.import_module(module)
-    finally:
-        print(f"Kernel loaded from: {target}")
-  
-def count():
-    i = 0
-    while True:
-        yield i
-        i += 1
-
-def unsqueeze(dim, rank):
-    assert 0 <= dim < rank
-    if rank > 1:
-        vals = ['None' for _ in range(rank)]
-        vals[dim] = ':'
-        return '[' + ', '.join(vals) + ']'
-    else:
-        return ''
-
-def header(str, width=40):
-    return f'#{f' {str} ':#^{width-2}}#'
-
-def comment(*, body=None, title=None, width=40):
-    lines = [f'#{f' {line} ': <{width-2}}#' for line in wrap(body, width-4)]
-    stop = ('#' * width)
-    start = header(title, width=width) if title else stop
-    return '\n'.join([start, *lines, stop])
-
-def tagged(name, tag):
-    if tag is not None:
-        return f'{name}_{tag}'
-    else:
-        return name
-
-def render(*lines):
-    builder = []
-    for line in lines:
-        if isinstance(line, str):
-            builder.append(line)
-        elif isinstance(line, Iterable):
-            stuff = render(*line)
-            builder.append(indent(stuff, prefix=' '*4))
-    return '\n'.join(builder)
-
-def csv(*vals, trailing_comma=True):
-    if trailing_comma:
-        return ', '.join(vals) + ','
-    else:
-        return ', '.join(vals)
-
-def tuplify(*vals):
-    return f'({csv(*vals)})'
-
-def deepmap(sequence, *functions):
-    for f in functions:
-        sequence = tz.mapcat(f, sequence)
-    return sequence
-
-class Info(SimpleNamespace):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-    def tagged(self, **kwargs):
-        return copy.replace(self, **kwargs)
-
-    def get(self, key, default=None):
-        return getattr(self, key, default)
-
-    @property
-    def name(self):
-        return tagged(self._name, self.get('var'))
-
-class DimInfo(Info):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.refs = []
-
-    def add_ref(self, name, index):
-        self.refs.append([name, index])
-    
-    @property
-    def shape_assign(self):
-        shapes = {name: f'{name}.shape[{index}]' for name, index in self.refs}
-        initial, *rest = list(shapes.values())
-        assign = f'{self.dim} = {initial}'
-        if rest:
-            assertion = ' == '.join([initial, *rest])
-            message = f'f"shape mismatch: {self.name} has inconsistent shapes: {', '.join([f'{name}: {{{shape}}}' for name, shape in shapes.items()])}"'
-            return [assign, f'assert {assertion}, {message}']
-        else:
-            return [assign]
-
-    @property
-    def block(self):
-        if self.tiled:
-            return f'{self.name}_block'
-        else:
-            raise ValueError(f'Getting block from non-tiled dimension: {self}')
-
-    @property
-    def dim(self):
-        return f'{self.name}_dim'
-
-    @property
-    def pid(self):
-        if self.tiled:
-            return f'{self.name}_pid'
-        else:
-            raise ValueError(f'Getting pid from non-tiled dimension: {self}')
-
-    def offsets(self, wrapped=True):
-        if self.tiled:
-            offs = f'(({self.pid} * {self.block}) + tl.arange(0, {self.block}))'
-            if wrapped:
-                return f'({offs} % {self.dim})'
-            else:
-                return offs
-        else:
-            return f'tl.arange(0, {self.dim})'
-
-    @property
-    def bounds(self):
-        return f'({self.offsets(wrapped=False)} < {self.dim})'
-
-    @property
-    def def_bounds(self):
-        return f'{self.bounds} = ({self.offsets(wrapped=False)} < {self.dim})'
-    
-class NamedInfo(Info):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-    @property
-    def rank(self):
-        return len(self.shape)
-    
-    @property
-    def ptr(self):
-        return f'{self.name}_global_ptr'
-
-    
-    @property
-    def tile(self):
-        return f'{self.name}_tile'
-
-    def stride(self, d):
-        assert d in self.shape
-        return f'{self.name}_stride_{d}'
-    
-    @property
-    def strides(self):
-        if self.get('contiguous'):
-            accum = ['1']
-            builder = []
-            for d in reversed(self.shape):
-                builder.append(' * '.join(accum))
-                accum.append(self.shape[d].dim)
-            return [f'({x})' for x in reversed(builder)]
-        else:
-            return [f'{self.stride(d)}' for d in self.shape]
-    
-    @property
-    def args(self):
-        ret = [self.ptr]
-        if self.get('contiguous'):
-            return ret
-        else:
-            return ret + self.strides
-    
-    @property
-    def torch_args(self):
-        ret = [self.name]
-        if self.get('contiguous'):
-            return ret
-        else:
-            return ret + [f'*{self.name}.stride()']
-    
-    @property
-    def offsets(self):
-        builder = []
-        for i, stride, d in zip(count(), self.strides, self.shape.values()):
-            builder.append(f'({d.offsets()} * {stride}){unsqueeze(i, self.rank)}')
-        return ' + '.join(builder)
-    
-    @property
-    def mask(self):
-        builder = []
-        for i, stride, d in zip(count(), self.strides, self.shape.values()):
-            if d.name in 'lr':
-                builder.append(f'{d.bounds}{unsqueeze(i, self.rank)}')
-        assert len(builder) == 1, 'no two matrices can have both l and r dimension'
-        return builder[0]
-    
-    @property
-    def tile_ptrs(self):
-        return f'{self.ptr} + {self.offsets}'
-
-    def load(self, src=None):
-        if src is None: src = self
-        return f'{self.tile} = tl.load({src.tile_ptrs}, mask={src.mask})'
-
-    def store(self, src=None):
-        if src is None: src = self
-        return f'tl.store({self.tile_ptrs}, {src.tile}, mask={self.mask})'
-    
-    def add(self, other):
-        return f'{self.tile} = {self.tile} + {other.tile}'
-
-    def atomic_add(self, src, sem='relaxed'):
-        if src is None: src = self
-        return f'tl.atomic_add({self.tile_ptrs}, {src.tile}, mask={self.mask}, sem="{sem}")'
-    
-    @property
-    def shape_tuple(self):
-        return tuplify(*[d.dim for d in self.shape.values()])
-    
-    @property
-    def init(self):
-        return f'{self.name} = torch.full({self.shape_tuple}, {self.initval}, dtype={self.dtype}, device=device)'
-
-    @classmethod
-    def from_info(cls, name: str, info: Info, shapes: Dict[str, DimInfo], **kwargs):
-        meta = vars(copy.deepcopy(info))
-        meta.pop('shape')
-        return cls(_name=name, shape={d: shapes[d] for d in info.shape}, **meta, **kwargs)
-
-def mk_kernel(
+def mk_triton_kernel(
         ls: Dict[str, Info], 
         rs: Dict[str, Info], 
         ps: Dict[str, Info], 
@@ -278,24 +26,21 @@ def mk_kernel(
             for d in info.shape:
                 if d in D:
                     continue
-                if d in dim_info:
-                    kwargs = dim_info[d]
-                else:
-                    kwargs = {'tiled': d in 'lr'}
-                D[d] = DimInfo(_name=d, **kwargs)
+                kwargs = dim_info.get(d, {})
+                D[d] = DimInfo(_name=d, tiled=d in 'lr', **kwargs)
 
-    L = [NamedInfo.from_info(f'l_{l}', info, D) for l, info in ls.items()]
-    R = [NamedInfo.from_info(f'r_{r}', info, D) for r, info in rs.items()]
-    P = [NamedInfo.from_info(f'p_{p}', info, D, contiguous=True) for p, info in ps.items()]
+    L = [TensorInfo.from_info(f'l_{l}', info, D) for l, info in ls.items()]
+    R = [TensorInfo.from_info(f'r_{r}', info, D) for r, info in rs.items()]
+    P = [TensorInfo.from_info(f'p_{p}', info, D, contiguous=True) for p, info in ps.items()]
 
     for x in L + R:
         for i, d in enumerate(x.shape):
             D[d].add_ref(x.name, i)
 
-    L_GRAD_TMP = [l.tagged(var='grad_tmp', contiguous=True) for l in L]
-    R_GRAD_TMP = [r.tagged(var='grad_tmp', contiguous=True) for r in R]
     L_GRAD = [l.tagged(var='grad', contiguous=True, initval='0.0', dtype=l.grad_dtype) for l in L]
     R_GRAD = [r.tagged(var='grad', contiguous=True, initval='0.0', dtype=r.grad_dtype) for r in R]
+    L_GRAD_TMP = [l.tagged(var='grad_tmp') for l in L]
+    R_GRAD_TMP = [r.tagged(var='grad_tmp') for r in R]
 
     P_AGG = [p.tagged(var='agg') for p in P]
     P_TMP = [p.tagged(var='tmp') for p in P]
@@ -303,11 +48,12 @@ def mk_kernel(
     if bs is None:
         B = P
     else:
-        B = [NamedInfo.from_info(f'b_{b}', info, D) for b, info in bs.items()]
+        B = [TensorInfo.from_info(f'b_{b}', info, D) for b, info in bs.items()]
     
     dims = [d.dim for d in D.values()]
     bounds = [d.bounds for d in D.values() if d.tiled]
     blocks = [d.block for d in D.values() if d.tiled]
+
 
     def on_bundle(bundle, f):
         return [f(info) for info in bundle]
@@ -334,9 +80,22 @@ def mk_kernel(
         if src is None: src = dst
         return [d.add(s) for d, s in zip(dst, src)]
 
-
     def inits(xs):
         return [x.init for x in xs]
+
+    batched = {k: v for k, v in D.items() if v.is_batched}
+
+    if batched:
+        print(batched)
+        total = ' * '.join([b.dim for b in batched.values()])
+        print(f'batch_pids = {total}')
+        print('batch_pid = tl.program_id(axis=2)')
+        ordered = list(batched.values())
+        for i, d in enumerate(ordered):
+            print(f'{d.pid} = ???')
+
+        print(csv(*[b.dim for b in batched.values()]))
+
 
     def do_binary_reduce(dst, l, r):
         return f'{csv(*tiles(dst))} = binary_reduce({csv(*tiles(l), *tiles(r))})'
@@ -354,6 +113,8 @@ def mk_kernel(
         combinations = product(l_blocks, r_blocks, shards, num_stages, num_warps)
         return 'configs=[', [mk_config(*args) +',' for args in combinations], '],'
 
+
+
     fwd_kernel = render(
         comment(title = 'forward kernel', body = 'generated triton language forward kernel'),
         '@triton.autotune(',
@@ -368,7 +129,7 @@ def mk_kernel(
         ((
             *[csv(*x.args) for x in L + R + P],
             'lock_ptr,', 
-            *[f'{d.dim},' if d.tiled else f'{d.dim}: tl.constexpr,' for d in D.values()],
+            *[f'{d.dim},' if d.tiled or d.is_batched else f'{d.dim}: tl.constexpr,' for d in D.values()],
             'shards: tl.constexpr,',
             *[f'{b}: tl.constexpr,' for b in blocks],
             '):',
@@ -410,7 +171,7 @@ def mk_kernel(
         "def bwd_kernel(",
         ((
             *[csv(*x.args) for x in L + R + B + L_GRAD + R_GRAD],
-            *[f'{d.dim},' if d.tiled else f'{d.dim}: tl.constexpr,' for d in D.values()],
+            *[f'{d.dim},' if d.tiled or d.is_batched else f'{d.dim}: tl.constexpr,' for d in D.values()],
             'shards: tl.constexpr,',
             *[f'{b}: tl.constexpr,' for b in blocks],
             '):',
@@ -495,19 +256,22 @@ def mk_kernel(
             ),
     )
 
+    module_code = render(
+        'import torch',
+        'import triton.language as tl',
+        'import triton',
+        '',
+        code,
+        '',
+        fwd_kernel,
+        '',
+        bwd_kernel,
+        '',
+        function,
+    )
 
-    module = mk_module(render(
-            'import torch',
-            'import triton.language as tl',
-            'import triton',
-            '',
-            code,
-            '',
-            fwd_kernel,
-            '',
-            bwd_kernel,
-            '',
-            function,
-        ))
+    print(module_code)
+
+    module = mk_module(module_code)
 
     return module.function

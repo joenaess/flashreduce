@@ -1,34 +1,34 @@
-from scaffold import mk_kernel, Info
+from flashreduce.codegen import mk_triton_kernel, Info, literal
 
 import torch
 import triton
 import triton.language as tl
 
-code = """\
+@literal
 @triton.jit
 def proj_reduce(q, k, v, l_bounds, r_bounds):
     logits = tl.dot(q, k.trans())
     logits = tl.where(l_bounds[:, None] & r_bounds[None, :], logits, float('-inf'))
     hi = tl.max(logits, axis=1)
     valid = hi > float('-inf')
-    weights = tl.where(valid[:, None], (logits - hi[:, None]).exp(), 0.0)
-    wz = weights.sum(axis=1)
-    wv = tl.dot(weights.cast(v.dtype), v)
-    pv = wv / tl.where(valid, wz, float('inf'))[:, None]
-    pz = hi + wz.log()
+    pz = tl.where(valid, hi + (logits - hi[:, None]).exp().sum(axis=1).log(), hi)
+    weights = tl.where(valid[:, None], (logits - pz[:, None]), hi[:, None])
+    pv = tl.dot(weights.exp().cast(v.dtype), v)
     return pz, pv
 
+@literal
 @triton.jit
 def binary_reduce(xz, xv, yz, yv):
     hi = tl.maximum(xz, yz)
     lo = tl.minimum(xz, yz)
     valid = hi > float('-inf')
-    pz = hi + (1 + (lo - hi).exp()).log()
-    pv = xv * (xz - pz).exp()[:, None] + yv * (yz - pz).exp()[:, None]
-    pz = tl.where(valid, pz, hi)
-    pv = tl.where(valid[:, None], pv, 0.0)
+    pz = tl.where(valid, hi + (1 + (lo - hi).exp()).log(), hi)
+    xw = tl.where(valid, (xz - pz).exp(), 0.0)[:, None]
+    yw = tl.where(valid, (yz - pz).exp(), 0.0)[:, None]
+    pv = xv * xw + yv * yw
     return pz, pv
 
+@literal
 @triton.jit
 def proj_reduce_bwd(q, k, v, z, dot_vg, gv, l_bounds, r_bounds):
     logits = tl.dot(q, k.trans())
@@ -44,20 +44,23 @@ def proj_reduce_bwd(q, k, v, z, dot_vg, gv, l_bounds, r_bounds):
 
     return grad_q, grad_k, grad_v
 
+@literal
 def fwd_epilogue(pz, pv):
     return pv,
 
+@literal
 def bwd_prologue(pz, pv, gv):
     return pz, (pv * gv).sum(1), gv
-"""
 
-_kernel = mk_kernel(
-    ls={'q': Info(shape='li', grad_dtype=torch.float32)}, 
-    rs={'k': Info(shape='ri', grad_dtype=torch.float32), 'v': Info(shape='ro', grad_dtype=torch.float32)}, 
-    ps={'z': Info(shape='l', dtype=torch.float32, initval="float('-inf')"), 'v': Info(shape='lo', dtype=torch.bfloat16, initval="0.0")},
-    bs={'z': Info(shape='l'), 'dot_vg': Info(shape='l'), 'gv': Info(shape='lo')},
+code = '\n\n'.join([proj_reduce, proj_reduce_bwd, binary_reduce, fwd_epilogue, bwd_prologue])
+
+_kernel = mk_triton_kernel(
+    ls={'q': Info(shape='ghli', grad_dtype=torch.float32)}, 
+    rs={'k': Info(shape='hri', grad_dtype=torch.float32), 'v': Info(shape='hro', grad_dtype=torch.float32)}, 
+    ps={'z': Info(shape='ghl', dtype=torch.float32, initval="float('-inf')"), 'v': Info(shape='ghlo', dtype=torch.bfloat16, initval="0.0")},
+    bs={'z': Info(shape='ghl'), 'dot_vg': Info(shape='ghl'), 'gv': Info(shape='ghlo')},
     code=code,
-    shards=[32],
+    dim_info={'h': {'batched': True}, 'g': {'batched': True}}
 )
 
 #@torch.compile(fullgraph=True)
