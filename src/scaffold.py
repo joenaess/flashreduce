@@ -6,48 +6,37 @@ from itertools import product
 import toolz as tz
 import tempfile
 import importlib.util
+import pathlib
 import os
 import sys
 import copy
+import hashlib
 
-def compile_and_bind(source_code: str, **dependencies):
-    """
-    1. Writes source_code to a temporary file.
-    2. Loads it as a module.
-    3. Injects 'dependencies' (functions/constants) into the module's namespace.
-    """
-    # 1. Create a named temporary file (Triton needs a real file path for source lookups)
-    assert 'proj_reduce' in dependencies
-    assert 'proj_reduce_bwd' in dependencies
-    assert 'binary_reduce' in dependencies
+FLASHREDUCE_CACHE = pathlib.Path(os.getenv('FLASHREDUCE_CACHE', 'kernel_cache')).absolute()
+FLASHREDUCE_CACHE.mkdir(exist_ok=True, parents=True)
+(FLASHREDUCE_CACHE / '__init__.py').touch()
+if FLASHREDUCE_CACHE not in sys.path:
+    sys.path.append(str(FLASHREDUCE_CACHE))
 
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as tmp:
-        tmp_path = tmp.name
-        # Ensure the generated code imports the basics required for the kernel syntax
-        tmp.write("import triton\n")
-        tmp.write("import triton.language as tl\n")
-        tmp.write("import torch\n\n")
-        tmp.write(source_code)
-
+def mk_module(source_code):
+    hash = hashlib.sha256(source_code.encode('utf-8')).hexdigest()
+    module = f'generated_module_{hash}'
+    target = FLASHREDUCE_CACHE / f'{module}.py'
+    
+    if target.exists():
+        with open(target, 'rt') as f:
+            assert f.read() == source_code, "hash equals but code mismatch: {target}"
+    else:
+        with open(target, 'wt') as f:
+            f.write(source_code)
     try:
-        # 2. Load the module dynamically
-        spec = importlib.util.spec_from_file_location("generated_kernel_mod", tmp_path)
-        mod = importlib.util.module_from_spec(spec)
-        
-        # 3. INJECT DEPENDENCIES BEFORE EXECUTION
-        # This effectively does "from caller import proj_reduce" dynamically
-        for name, obj in dependencies.items():
-            setattr(mod, name, obj)
-            
-        # Execute the module (this defines fwd_kernel/bwd_kernel using the injected deps)
-        sys.modules["generated_kernel_mod"] = mod
-        spec.loader.exec_module(mod)
-        
-        return mod
+        return importlib.import_module(module)
+        #spec = importlib.util.spec_from_file_location("generated_kernel_mod", target)
+        #mod = importlib.util.module_from_spec(spec)
+        #spec.loader.exec_module(mod)
+        #return mod
     finally:
-        # Optional: You can unlink the file, but keep in mind debugging is harder.
-        # os.unlink(tmp_path) 
-        print(f"Kernel generated at: {tmp_path}")
+        print(f"Kernel loaded from: {target}")
   
 def count():
     i = 0
@@ -157,7 +146,7 @@ class DimInfo(Info):
 
     def offsets(self, wrapped=True):
         if self.tiled:
-            offs = f'({self.pid} * {self.block}) + tl.arange(0, {self.block}))'
+            offs = f'(({self.pid} * {self.block}) + tl.arange(0, {self.block}))'
             if wrapped:
                 return f'({offs} % {self.dim})'
             else:
@@ -263,7 +252,7 @@ class NamedInfo(Info):
     
     @property
     def init(self):
-        return f'{self.name} = torch.full({self.shape_tuple}, init={self.initval}, dtype={self.dtype}, device=device)'
+        return f'{self.name} = torch.full({self.shape_tuple}, {self.initval}, dtype={self.dtype}, device=device)'
 
     @classmethod
     def from_info(cls, name: str, info: Info, shapes: Dict[str, DimInfo], **kwargs):
@@ -276,13 +265,16 @@ def mk_kernel(
         rs: Dict[str, Info], 
         ps: Dict[str, Info], 
         bs: Dict[str, Info] = None,
+        code: str = None,
         dim_info: Dict[str, Dict[str, Any]] = {},
-        proj_reduce = None,
-        proj_reduce_bwd = None,
-        binary_reduce = None,
-        fwd_epilogue = None,
-        bwd_prologue = None,
+        l_blocks = [16, 32],
+        r_blocks = [16, 32, 64],
+        shards = [1, 4, 16, 64],
+        num_stages = [3, 4],
+        num_warps = [4, 8],
         ):
+
+    assert code is not None
     
     D = {}
     for bundle in [ls, rs, ps]:
@@ -296,7 +288,6 @@ def mk_kernel(
                     kwargs = {'tiled': d in 'lr'}
                 D[d] = DimInfo(_name=d, **kwargs)
 
-    #D = {d: DimInfo(_name=d, **dim_info.get(d, {'tiled': True} if d in 'lr' else {'tiled': False})) for d in deepmap([ls, rs, ps], lambda x: x.values(), lambda x: x.shape)}
     L = [NamedInfo.from_info(f'l_{l}', info, D) for l, info in ls.items()]
     R = [NamedInfo.from_info(f'r_{r}', info, D) for r, info in rs.items()]
     P = [NamedInfo.from_info(f'p_{p}', info, D, contiguous=True) for p, info in ps.items()]
@@ -351,29 +342,29 @@ def mk_kernel(
     def inits(xs):
         return [x.init for x in xs]
 
-    def binary_reduce(dst, l, r):
+    def do_binary_reduce(dst, l, r):
         return f'{csv(*tiles(dst))} = binary_reduce({csv(*tiles(l), *tiles(r))})'
 
-    def proj_reduce(l, r, dst):
+    def do_proj_reduce(l, r, dst):
         return f'{csv(*tiles(dst))} = proj_reduce({csv(*tiles(l), *tiles(r), *bounds)})'
 
-    def proj_reduce_bwd(l, r, b, l_dst, r_dst):
+    def do_proj_reduce_bwd(l, r, b, l_dst, r_dst):
         return f'{csv(*tiles(l_dst), *tiles(r_dst))} = proj_reduce_bwd({csv(*tiles(l), *tiles(r), *tiles(b), *bounds)})'
 
     def mk_config(l_block, r_block, shards, num_stages, num_warps):
-        return f'triton.Config(kwargs={{ "{D['l'].block}": {l_block}, "{D['r'].block}": {r_block} "shards": {shards} }}, num_stages={num_stages}, num_warps={num_warps})'
+        return f'triton.Config(kwargs={{ "{D['l'].block}": {l_block}, "{D['r'].block}": {r_block}, "shards": {shards} }}, num_stages={num_stages}, num_warps={num_warps})'
+
+    def mk_configs():
+        combinations = product(l_blocks, r_blocks, shards, num_stages, num_warps)
+        return 'configs=[', [mk_config(*args) +',' for args in combinations], '],'
 
     fwd_kernel = render(
         comment(title = 'forward kernel', body = 'generated triton language forward kernel'),
         '@triton.autotune(',
         (
-            'configs=[',
-            [mk_config(l_block, r_block, shards, num_stages, num_warps) + ',' for 
-             (l_block, r_block, shards, num_stages, num_warps) in 
-             product([16, 32], [16, 32], [4, 8, 32], [3, 4], [4, 8])],
-            ']',
-            f'key=[{csv(*dims)}]',
-            'restore_value=["lock_ptr"]',
+            *mk_configs(),
+            f'key=[{csv(*[f'"{d}"' for d in dims])}],',
+            'restore_value=["lock_ptr"],',
             ')',
         ),
         "@triton.jit",
@@ -381,7 +372,7 @@ def mk_kernel(
         ((
             *[csv(*x.args) for x in L + R + P],
             'lock_ptr,', 
-            csv(*dims),
+            *[f'{d.dim},' if d.tiled else f'{d.dim}: tl.constexpr,' for d in D.values()],
             'shards: tl.constexpr,',
             *[f'{b}: tl.constexpr,' for b in blocks],
             '):',
@@ -389,36 +380,41 @@ def mk_kernel(
             comment(title='SETUP', body='set up pids, offsets, et.c.'),
             'l_pid = tl.program_id(axis=0)',
             'r_pid = tl.program_id(axis=1)',
-            f'r_tiles = tl.cdiv({D['r'].dim}, {D['r'].block})',
-            'r_group = tl.cdiv(r_tiles, shards)',
-            #*[info.def_offsets() for info in D.values()],
+            f'r_group = tl.cdiv({D['r'].dim}, {D['r'].block} * shards)',
             comment(title='LOAD', body='load L and (initial) R tiles, and perform the first proj_reduce'),
             *loads(L + R),
-            proj_reduce(l=L, r=R, dst=P_AGG),
+            do_proj_reduce(l=L, r=R, dst=P_AGG),
             comment(title='LOOP', body='loop over R tiles, and aggregate the intermediate P-values'),
             'for k in range(1, r_group):',
             (
                 f'r_pid += shards',
                 *loads(R),
-                proj_reduce(l=L, r=R, dst=P_TMP),
-                binary_reduce(dst=P_AGG, l=P_AGG, r=P_TMP),
+                do_proj_reduce(l=L, r=R, dst=P_TMP),
+                do_binary_reduce(dst=P_AGG, l=P_AGG, r=P_TMP),
             ),
             comment(title='GLOBAL UPDATE', body='Acquire lock (over L-tile), update global value with local values, store to global, then release the lock'),
-            'while tl.atomic_cas(lock_ptr, l_pid, 0, 1, sem="acquire") == 1:', ['pass'],
+            'while tl.atomic_cas(lock_ptr + l_pid, 0, 1, sem="acquire") == 1:', ['pass'],
             *loads(dst=P_TMP, src=P),
-            binary_reduce(dst=P_AGG, l=P_AGG, r=P_TMP),
+            do_binary_reduce(dst=P_AGG, l=P_AGG, r=P_TMP),
             *stores(dst=P, src=P_AGG),
-            'tl.atomic_xchg(lock_ptr, l_pid, 0, sem="release")'
+            'tl.atomic_xchg(lock_ptr + l_pid, 0, sem="release")'
         ),
     )
 
     bwd_kernel = render(
         comment(title = 'backward kernel', body = 'generated triton language backward kernel'),
+        '@triton.autotune(',
+        (
+            *mk_configs(),
+            f'key=[{csv(*[f'"{d}"' for d in dims])}],',
+            f'restore_value=[{csv(*[f'"{name}"' for name in names(L_GRAD + R_GRAD)])}],',
+            ')',
+        ),
         "@triton.jit",
         "def bwd_kernel(",
         ((
             *[csv(*x.args) for x in L + R + B + L_GRAD + R_GRAD],
-            csv(*dims),
+            *[f'{d.dim},' if d.tiled else f'{d.dim}: tl.constexpr,' for d in D.values()],
             'shards: tl.constexpr,',
             *[f'{b}: tl.constexpr,' for b in blocks],
             '):',
@@ -426,18 +422,17 @@ def mk_kernel(
             comment(title='SETUP', body='set up pids, offsets, et.c.'),
             'l_pid = tl.program_id(axis=0)',
             'r_pid = tl.program_id(axis=1)',
-            f'r_tiles = tl.cdiv({D['r'].dim}, {D['r'].block})',
-            'r_group = tl.cdiv(r_tiles, shards)',
+            f'r_group = tl.cdiv({D['r'].dim}, {D['r'].block} * shards)',
             comment(title='LOAD', body='load L, B, and (initial) R tiles, and perform the first proj_reduce_bwd (and R-grad update)'),
             *loads(L + R + B),
-            proj_reduce_bwd(l=L, r=R, b=B, l_dst=L_GRAD, r_dst=R_GRAD),
+            do_proj_reduce_bwd(l=L, r=R, b=B, l_dst=L_GRAD, r_dst=R_GRAD),
             *atomic_adds(R_GRAD),
             comment(title='LOOP', body='loop over R tiles. Update global R-grad (with atomic add), and aggregate L-grads.'),
             'for k in range(1, r_group):',
             (
                 f'r_pid += shards',
                 *loads(R),
-                proj_reduce_bwd(l=L, r=R, b=B, l_dst=L_GRAD_TMP, r_dst=R_GRAD),
+                do_proj_reduce_bwd(l=L, r=R, b=B, l_dst=L_GRAD_TMP, r_dst=R_GRAD),
                 *atomic_adds(R_GRAD),
                 *adds(dst=L_GRAD, src=L_GRAD_TMP),
             ),
@@ -456,11 +451,12 @@ def mk_kernel(
                     f'device = {L[0].name}.device',
                     *[line for d in D.values() for line in d.shape_assign],
                     *inits(P),
+                    f'grid = lambda META: (triton.cdiv({D['l'].dim}, META["{D['l'].block}"]), META["shards"])',
                     'lock = torch.zeros(l_dim, device=device, dtype=torch.int32)',
                     'fwd_kernel[grid](',
                     (
                         *[csv(*x.torch_args) for x in [*L, *R, *P]],
-                        'lock',
+                        'lock,',
                         csv(*[d.dim for d in D.values()]),
                     ),
                     ')',
@@ -477,7 +473,7 @@ def mk_kernel(
                 ),
                 ''
                 '@staticmethod',
-                '@once_differentiable',
+                '@torch.autograd.function.once_differentiable',
                 f'def backward({csv('ctx', *[f'_{p.name}' for p in P], '*grads_in')}):',
                 (
                     f'device = {L[0].name}.device',
@@ -485,35 +481,37 @@ def mk_kernel(
                     f'{csv(*names(B))} = bwd_prologue({csv(*names(P))} *grads_in)',
                     *[line for d in D.values() for line in d.shape_assign],
                     *inits(L_GRAD + R_GRAD),
+                    f'grid = lambda META: (triton.cdiv({D['l'].dim}, META["{D['l'].block}"]), META["shards"])',
                     'bwd_kernel[grid](',
                     (
                         *[csv(*x.torch_args) for x in [*L, *R, *B, *L_GRAD, *R_GRAD]],
-                        csv(*[d.dim for d in D.values()]),
+                        csv(*dims),
                     ),
                     ')',
                     f'return {csv(*names(L_GRAD + R_GRAD))}',
                 ),
             ),
-    )
-    
-    module = '\n'.join([
-        'import torch',
-        'import triton.language as tl',
-        'import triton',
-        '',
-        fwd_kernel,
-        '',
-        bwd_kernel,
-        '',
-        function,
-        ])
-    print(module)
 
-if __name__ == '__main__':
-    import torch
-    mk_kernel(
-            ls={'q': Info(shape='li', grad_dtype=torch.float32)}, 
-            rs={'k': Info(shape='ri', grad_dtype=torch.float32), 'v': Info(shape='ro', grad_dtype=torch.float32)}, 
-            ps={'z': Info(shape='l', dtype=torch.float32, initval="float('-inf')"), 'v': Info(shape='lo', dtype=torch.bfloat16, initval="0.0")},
-            bs={'z': Info(shape='l'), 'vz': Info(shape='l'), 'gv': Info(shape='lo')},
-            )
+            f'def function({csv(*names(L + R), trailing_comma=False)}):',
+            (
+                f'{csv(*names(P))} *out = TritonMonoidReduceFn.apply({csv(*names(L + R), trailing_comma=False)})',
+                'return out'
+            ),
+    )
+
+
+    module = mk_module(render(
+            'import torch',
+            'import triton.language as tl',
+            'import triton',
+            '',
+            code,
+            '',
+            fwd_kernel,
+            '',
+            bwd_kernel,
+            '',
+            function,
+        ))
+
+    return module.function
