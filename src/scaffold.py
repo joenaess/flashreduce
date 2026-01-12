@@ -31,10 +31,6 @@ def mk_module(source_code):
             f.write(source_code)
     try:
         return importlib.import_module(module)
-        #spec = importlib.util.spec_from_file_location("generated_kernel_mod", target)
-        #mod = importlib.util.module_from_spec(spec)
-        #spec.loader.exec_module(mod)
-        #return mod
     finally:
         print(f"Kernel loaded from: {target}")
   

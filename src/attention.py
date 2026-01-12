@@ -10,21 +10,27 @@ def proj_reduce(q, k, v, l_bounds, r_bounds):
     logits = tl.dot(q, k.trans())
     logits = tl.where(l_bounds[:, None] & r_bounds[None, :], logits, float('-inf'))
     hi = tl.max(logits, axis=1)
-    logits = (logits - hi[:, None]).exp()
-    pz = logits.sum(axis=1)
-    pv = tl.dot(logits.cast(v.dtype), v) / pz[:, None]
-    return hi + pz.log(), pv
+    valid = hi > float('-inf')
+    weights = tl.where(valid[:, None], (logits - hi[:, None]).exp(), 0.0)
+    wz = weights.sum(axis=1)
+    wv = tl.dot(weights.cast(v.dtype), v)
+    pv = wv / tl.where(valid, wz, float('inf'))[:, None]
+    pz = hi + wz.log()
+    return pz, pv
 
 @triton.jit
 def binary_reduce(xz, xv, yz, yv):
     hi = tl.maximum(xz, yz)
     lo = tl.minimum(xz, yz)
+    valid = hi > float('-inf')
     pz = hi + (1 + (lo - hi).exp()).log()
     pv = xv * (xz - pz).exp()[:, None] + yv * (yz - pz).exp()[:, None]
+    pz = tl.where(valid, pz, hi)
+    pv = tl.where(valid[:, None], pv, 0.0)
     return pz, pv
 
 @triton.jit
-def proj_reduce_bwd(q, k, v, z, dot_vg, gv):
+def proj_reduce_bwd(q, k, v, z, dot_vg, gv, l_bounds, r_bounds):
     logits = tl.dot(q, k.trans())
     ws = (logits - z[:, None]).exp()
     
@@ -51,6 +57,7 @@ _kernel = mk_kernel(
     ps={'z': Info(shape='l', dtype=torch.float32, initval="float('-inf')"), 'v': Info(shape='lo', dtype=torch.bfloat16, initval="0.0")},
     bs={'z': Info(shape='l'), 'dot_vg': Info(shape='l'), 'gv': Info(shape='lo')},
     code=code,
+    shards=[32],
 )
 
 #@torch.compile(fullgraph=True)
@@ -58,9 +65,12 @@ def flashreduce_attention(q, k, v):
     y, = _kernel(q, k, v)
     return y
 
-@torch.compile(fullgraph=True)
 def naive_attention(q, k, v):
     return (q @ k.t()).softmax(dim=1) @ v
+
+def hiprec_attention(q, k, v):
+    return naive_attention(q.to(torch.float32), k.to(torch.float32), v.to(torch.float32))
+
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
@@ -80,19 +90,35 @@ def benchmark(N, provider):
     D = 128
     DEVICE = 'cuda'
     DTYPE = torch.bfloat16
-    q = torch.rand(N, D, device=DEVICE, dtype=DTYPE)
-    k = torch.rand(N, D, device=DEVICE, dtype=DTYPE)
-    v = torch.randn(N, D, device=DEVICE, dtype=DTYPE)
+    q = torch.rand(N, D, device=DEVICE, dtype=DTYPE, requires_grad=True)
+    k = torch.rand(N, D, device=DEVICE, dtype=DTYPE, requires_grad=True)
+    v = torch.randn(N, D, device=DEVICE, dtype=DTYPE, requires_grad=True)
     mock = torch.randn(N, D, device=DEVICE, dtype=DTYPE)
     quantiles = [0.5, 0.2, 0.8]
     if provider == 'torch':
-        #ms, min_ms, max_ms = triton.testing.do_bench(lambda: (naive_attention(q, k, v) * mock).sum().backward(), quantiles=quantiles)
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: naive_attention(q, k, v), quantiles=quantiles)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: (naive_attention(q, k, v) * mock).sum().backward(), quantiles=quantiles)
+        #ms, min_ms, max_ms = triton.testing.do_bench(lambda: naive_attention(q, k, v), quantiles=quantiles)
     if provider == 'triton':
-        #ms, min_ms, max_ms = triton.testing.do_bench(lambda: (flashreduce_attention(q, k, v) * mock).sum().backward(), quantiles=quantiles)
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: flashreduce_attention(q, k, v), quantiles=quantiles)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: (flashreduce_attention(q, k, v) * mock).sum().backward(), quantiles=quantiles)
+        #ms, min_ms, max_ms = triton.testing.do_bench(lambda: flashreduce_attention(q, k, v), quantiles=quantiles)
     fps = lambda ms: N*N*D*4 * 1e-12 / (ms * 1e-3)
     return fps(ms), fps(max_ms), fps(min_ms)
 
 if __name__ == '__main__':
-    benchmark.run(print_data=True)
+    torch.random.manual_seed(0x5eed)
+    N = 1024
+    D = 128
+    DEVICE = 'cuda'
+    DTYPE = torch.bfloat16
+    q = torch.rand(N, D, device=DEVICE, dtype=DTYPE, requires_grad=True)
+    k = torch.rand(N, D, device=DEVICE, dtype=DTYPE, requires_grad=True)
+    v = torch.randn(N, D, device=DEVICE, dtype=DTYPE, requires_grad=True)
+    mock = torch.randn(N, D, device=DEVICE, dtype=DTYPE)
+    y1 = flashreduce_attention(q, k, v)
+    y2 = naive_attention(q, k, v)
+    y3 = hiprec_attention(q, k, v)
+    #(flashreduce_attention(q, k, v) * mock).sum().backward()
+    print(y1)
+    print(y2)
+    print(y3)
+    #benchmark.run(print_data=True)
