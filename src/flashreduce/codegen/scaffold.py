@@ -86,16 +86,28 @@ def mk_triton_kernel(
     batched = {k: v for k, v in D.items() if v.is_batched}
 
     if batched:
-        print(batched)
+        pid_assignment = [
+            'r_pid = tl.program_id(axis=1)',
+            'l_pid = tl.program_id(axis=2)',
+        ]
         total = ' * '.join([b.dim for b in batched.values()])
-        print(f'batch_pids = {total}')
-        print('batch_pid = tl.program_id(axis=2)')
+        grid_assignment.append(total)
         ordered = list(batched.values())
+        pid_assignment.append(f'batch_pid = tl.program_id(axis=0)')
         for i, d in enumerate(ordered):
-            print(f'{d.pid} = ???')
+            i_stride = ' * '.join([inner.dim for inner in ordered[i+1:]])
+            if i_stride:
+                pid_assignment.append(f'{d.pid} = (batch_pid // {i_stride}) % {d.dim}')
+            else:
+                pid_assignment.append(f'{d.pid} = batch_pid % {d.dim}')
 
-        print(csv(*[b.dim for b in batched.values()]))
-
+        grid_assignment = f'grid = lambda META: ({total}, META["shards"], triton.cdiv({D['l'].dim}, META["{D['l'].block}"]))'
+    else:
+        pid_assignment = [
+            'r_pid = tl.program_id(axis=0)',
+            'l_pid = tl.program_id(axis=1)',
+        ]
+        grid_assignment = f'grid = lambda META: (META["shards"], triton.cdiv({D['l'].dim}, META["{D['l'].block}"]), 1)'
 
     def do_binary_reduce(dst, l, r):
         return f'{csv(*tiles(dst))} = binary_reduce({csv(*tiles(l), *tiles(r))})'
@@ -135,8 +147,7 @@ def mk_triton_kernel(
             '):',
         ),
             comment(title='SETUP', body='set up pids, offsets, et.c.'),
-            'l_pid = tl.program_id(axis=0)',
-            'r_pid = tl.program_id(axis=1)',
+            *pid_assignment,
             f'r_group = tl.cdiv({D['r'].dim}, {D['r'].block} * shards)',
             comment(title='LOAD', body='load L and (initial) R tiles, and perform the first proj_reduce'),
             *loads(L + R),
@@ -177,8 +188,7 @@ def mk_triton_kernel(
             '):',
         ),
             comment(title='SETUP', body='set up pids, offsets, et.c.'),
-            'l_pid = tl.program_id(axis=0)',
-            'r_pid = tl.program_id(axis=1)',
+            *pid_assignment,
             f'r_group = tl.cdiv({D['r'].dim}, {D['r'].block} * shards)',
             comment(title='LOAD', body='load L, B, and (initial) R tiles, and perform the first proj_reduce_bwd (and R-grad update)'),
             *loads(L + R + B),
@@ -208,7 +218,7 @@ def mk_triton_kernel(
                     f'device = {L[0].name}.device',
                     *[line for d in D.values() for line in d.shape_assign],
                     *inits(P),
-                    f'grid = lambda META: (triton.cdiv({D['l'].dim}, META["{D['l'].block}"]), META["shards"])',
+                    grid_assignment,
                     'lock = torch.zeros(l_dim, device=device, dtype=torch.int32)',
                     'fwd_kernel[grid](',
                     (
@@ -225,7 +235,7 @@ def mk_triton_kernel(
                 'def setup_context(ctx, inputs, outputs):',
                 (
                     f'{csv(*names(P), '*_')} = outputs',
-                    *[f'ctx.mark_non_differentiable({name})' for name in names(P)],
+                    #*[f'ctx.mark_non_differentiable({name})' for name in names(P)],
                     f'ctx.save_for_backward({csv('*inputs', *names(P))})',
                 ),
                 ''
@@ -233,12 +243,12 @@ def mk_triton_kernel(
                 '@torch.autograd.function.once_differentiable',
                 f'def backward({csv('ctx', *[f'_{p.name}' for p in P], '*grads_in')}):',
                 (
-                    f'device = {L[0].name}.device',
                     f'{csv(*names(L + R + P))} = ctx.saved_tensors',
+                    f'device = {L[0].name}.device',
                     f'{csv(*names(B))} = bwd_prologue({csv(*names(P))} *grads_in)',
                     *[line for d in D.values() for line in d.shape_assign],
                     *inits(L_GRAD + R_GRAD),
-                    f'grid = lambda META: (triton.cdiv({D['l'].dim}, META["{D['l'].block}"]), META["shards"])',
+                    grid_assignment,
                     'bwd_kernel[grid](',
                     (
                         *[csv(*x.torch_args) for x in [*L, *R, *B, *L_GRAD, *R_GRAD]],
@@ -269,8 +279,6 @@ def mk_triton_kernel(
         '',
         function,
     )
-
-    print(module_code)
 
     module = mk_module(module_code)
 

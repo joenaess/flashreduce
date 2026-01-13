@@ -195,7 +195,7 @@ class TensorInfo(Info):
 
     def load(self, src=None):
         if src is None: src = self
-        return f'{self.tile} = tl.load({src.tile_ptrs}, mask={src.mask})'
+        return f'{self.tile} = tl.load({src.tile_ptrs}, mask={src.mask}, other=0.0)'
 
     def store(self, src=None):
         if src is None: src = self

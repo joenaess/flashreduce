@@ -33,6 +33,7 @@ def binary_reduce(xz, xv, yz, yv):
 def proj_reduce_bwd(q, k, v, z, dot_vg, gv, l_bounds, r_bounds):
     logits = tl.dot(q, k.trans())
     ws = (logits - z[:, None]).exp()
+    ws = tl.where(l_bounds[:, None] & r_bounds[None, :], ws, 0.0)
     
     grad_v = tl.dot(ws.trans().cast(gv.dtype), gv)
 
@@ -55,15 +56,15 @@ def bwd_prologue(pz, pv, gv):
 code = '\n\n'.join([proj_reduce, proj_reduce_bwd, binary_reduce, fwd_epilogue, bwd_prologue])
 
 _kernel = mk_triton_kernel(
-    ls={'q': Info(shape='ghli', grad_dtype=torch.float32)}, 
-    rs={'k': Info(shape='hri', grad_dtype=torch.float32), 'v': Info(shape='hro', grad_dtype=torch.float32)}, 
-    ps={'z': Info(shape='ghl', dtype=torch.float32, initval="float('-inf')"), 'v': Info(shape='ghlo', dtype=torch.bfloat16, initval="0.0")},
-    bs={'z': Info(shape='ghl'), 'dot_vg': Info(shape='ghl'), 'gv': Info(shape='ghlo')},
+    ls={'q': Info(shape='li', grad_dtype=torch.float32)}, 
+    rs={'k': Info(shape='ri', grad_dtype=torch.float32), 'v': Info(shape='ro', grad_dtype=torch.float32)}, 
+    ps={'z': Info(shape='l', dtype=torch.float32, initval="float('-inf')"), 'v': Info(shape='lo', dtype=torch.bfloat16, initval="0.0")},
+    bs={'z': Info(shape='l'), 'dot_vg': Info(shape='l'), 'gv': Info(shape='lo')},
     code=code,
-    dim_info={'h': {'batched': True}, 'g': {'batched': True}}
+    #dim_info={'h': {'batched': True}, 'g': {'batched': True}}
 )
 
-#@torch.compile(fullgraph=True)
+@torch.compile(fullgraph=True)
 def flashreduce_attention(q, k, v):
     y, = _kernel(q, k, v)
     return y
@@ -99,16 +100,28 @@ def benchmark(N, provider):
     mock = torch.randn(N, D, device=DEVICE, dtype=DTYPE)
     quantiles = [0.5, 0.2, 0.8]
     if provider == 'torch':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: (naive_attention(q, k, v) * mock).sum().backward(), quantiles=quantiles)
-        #ms, min_ms, max_ms = triton.testing.do_bench(lambda: naive_attention(q, k, v), quantiles=quantiles)
+        #ms, min_ms, max_ms = triton.testing.do_bench(lambda: (naive_attention(q, k, v) * mock).sum().backward(), quantiles=quantiles)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: naive_attention(q, k, v), quantiles=quantiles)
     if provider == 'triton':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: (flashreduce_attention(q, k, v) * mock).sum().backward(), quantiles=quantiles)
-        #ms, min_ms, max_ms = triton.testing.do_bench(lambda: flashreduce_attention(q, k, v), quantiles=quantiles)
+        #ms, min_ms, max_ms = triton.testing.do_bench(lambda: (flashreduce_attention(q, k, v) * mock).sum().backward(), quantiles=quantiles)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: flashreduce_attention(q, k, v), quantiles=quantiles)
     fps = lambda ms: N*N*D*4 * 1e-12 / (ms * 1e-3)
     return fps(ms), fps(max_ms), fps(min_ms)
 
+def check_tensors(x, y, msg):
+    print(f'{f" {msg} ":=^30}')
+    try:
+        torch.testing.assert_close(x, y)
+        print('All good!')
+    except AssertionError as e:
+        print(e)
+    
+
+
 if __name__ == '__main__':
     torch.random.manual_seed(0x5eed)
+    G=3
+    H=12
     N = 1024
     D = 128
     DEVICE = 'cuda'
@@ -119,9 +132,17 @@ if __name__ == '__main__':
     mock = torch.randn(N, D, device=DEVICE, dtype=DTYPE)
     y1 = flashreduce_attention(q, k, v)
     y2 = naive_attention(q, k, v)
-    y3 = hiprec_attention(q, k, v)
+    y3 = hiprec_attention(q, k, v).to(y1.dtype)
     #(flashreduce_attention(q, k, v) * mock).sum().backward()
+    check_tensors(y1, y2, 'flash vs bf16')
+    check_tensors(y1, y3, 'flash vs fp32')
+    check_tensors(y2, y3, ' fp32 vs bf16')
     print(y1)
-    print(y2)
     print(y3)
+
+    (y1 * mock).sum().backward()
+    print('GRADS')
+    print(q.grad)
+    print(k.grad)
+    print(v.grad)
     #benchmark.run(print_data=True)
