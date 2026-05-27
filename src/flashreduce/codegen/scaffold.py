@@ -175,7 +175,7 @@ def mk_triton_kernel(
         (
             *mk_configs(),
             f'key=[{csv(*[f'"{d}"' for d in dims])}],',
-            f'restore_value=[{csv(*[f'"{name}"' for name in names(L_GRAD + R_GRAD)])}],',
+            f'restore_value=[{csv(*[f'"{x.ptr}"' for x in L_GRAD + R_GRAD])}],',
             ')',
         ),
         "@triton.jit",
